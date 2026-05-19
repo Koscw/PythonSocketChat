@@ -1,8 +1,37 @@
 import socket
 import threading
+import struct
 
-nestedList = [[('0.0.0.0', 00000), 'ALL REGISTERED USERS->']]
-logList = [[('0.0.0.0', 00000), 'ALL ONLINE USERS->']]
+pgp_keys_database = {}
+
+def recv_exact(sock, num_bytes):
+    buf = b''
+    while len(buf) < num_bytes:
+        chunk = sock.recv(num_bytes - len(buf))
+        if not chunk:
+            return False
+        buf += chunk
+    return buf
+def recv_msg(sock):
+    length = recv_exact(sock, 4)
+    if not length:
+        return False
+    data_length = struct.unpack("!I", length)[0]
+    data = recv_exact(sock, data_length)
+    if not data:
+        return False
+    return data.decode()
+def secure_send(sock, data):
+    encode_data = data.encode()
+    header = struct.pack("!I", len(encode_data))
+    try:
+        sock.sendall(header+encode_data)
+        return True
+    except (OSError, BrokenPipeError):
+        return False
+
+nestedList = [[('0.0.0.0', 00000), 'ALL REGISTERED USERS->', None, None]]
+logList = [[('0.0.0.0', 00000), 'ALL ONLINE USERS->', None, None]]
 
 def handle_client(conn, addr):
     print(f"[NEW CONNECTION] {addr} connected.")
@@ -10,116 +39,135 @@ def handle_client(conn, addr):
     while connected:
         try:
             # Receive message from client
-            msg = conn.recv(1024).decode('utf-8')
+            msg = recv_msg(conn)
             if not msg:
                 break
 
-            print(f"[{addr}] {msg}")
+            print(f"[{addr}] Command: {msg[:30]}")
 
             if msg.lower() == "terminate":  #If terminate message is received from user
                 delFromLogList(addr, logList)
                 printLogList(logList)
+                secure_send(conn, "terminate")
                 connected = False
             elif msg.lower() == "identifier": #If identifier message is received from user
-                newIdentifier = conn.recv(1024).decode('utf-8')
-                newIdentifierPassword = conn.recv(1024).decode('utf-8')
-                bindAddressToIdentifier(addr, newIdentifier, nestedList, conn, newIdentifierPassword, logList)
-                printNestedList(nestedList)
-                printLogList(logList)
-                serverAnswer = "identifier confirmed"
-                conn.send(serverAnswer.encode())
+                newIdentifier = recv_msg(conn)
+                newIdentifierPassword = recv_msg(conn)
+
+                if newIdentifier and newIdentifierPassword:
+                    success = bindAddressToIdentifier(addr, newIdentifier, nestedList, conn, newIdentifierPassword, logList)
+
+                    if not success:
+                        continue
+                    printNestedList(nestedList)
+                    printLogList(logList)
+
+                key_packet = recv_msg(conn)
+                if key_packet and key_packet.startswith("CLIENT_KEY:"):
+                    _, pem_key = key_packet.split(":",1)
+                    pgp_keys_database[newIdentifier] = pem_key
+                    print(f"[SYSTEM] Successfully stored PGP Public Key for {newIdentifier}")
+
+
             elif msg.lower() == "message": #If 'message' message is received from user
                 try:
-                    recipientName = conn.recv(1024).decode('utf-8')
+                    recipientName = recv_msg(conn)
+                    senderName = getNameByConnAddress(conn, nestedList)
                     nameCheck = verifyRecipientInLogBase(recipientName, logList)
                     if not nameCheck:
-                        serverAnswer = f"{recipientName} is not registered or not online."
-                        conn.send(serverAnswer.encode())
+                        secure_send(conn, f"{recipientName} is not registered or not online.")
+                        _ = recv_msg(conn)
                         continue
-
 
                     #serverAnswer = f"[{addr}] {recipientName} is registered."
                     #conn.send(serverAnswer.encode())
                     print(f"[{addr}] {recipientName} is registered.")
-                    recipientMessage = conn.recv(1024).decode('utf-8')
-                    senderName = getNameByConnAddress(conn, nestedList)
-                    adjustedRecipientMessage ="New message from <"+ senderName + "> : " + recipientMessage
-                    writeMessage(recipientName, adjustedRecipientMessage, nestedList )
-                    confirmation_message = f"{recipientName} received your message"
-                    conn.send(confirmation_message.encode())
+                    if recipientName in pgp_keys_database:
+                        exchange_payload = f"PUBKEY_EXCHANGE:{recipientName}:{pgp_keys_database[recipientName]}"
+                        secure_send(conn, exchange_payload)
+                    else:
+                        secure_send(conn, f"[SERVER ERROR] {recipientName} hasn't uploaded PGP key]")
+                        _ = recv_msg(conn)
+                        continue
+                    recipientMessage = recv_msg(conn)
+                    if recipientMessage == "CANCEL_MESSAGE" or not recipientMessage:
+                        continue
+                    adjustedMessage = f"MSG_FROM:{senderName}:{recipientMessage}"
+                    writeMessage(recipientName, adjustedMessage, nestedList )
+
+                    secure_send(conn, f"{recipientName} received your message")
                     continue
                 except Exception as e:
-                    print(f"Error: {e}")
+                    print(f"Error in message part: {e}")
+            elif msg.lower().startswith("get_key:"):
+                _, target_user = msg.split(":",1)
+                has_key = target_user in pgp_keys_database
+                target_key = pgp_keys_database.get(target_user)
+                if has_key:
+                    secure_send(conn, f"PUBKEY_EXCHANGE:{target_user}:{target_key}")
+                else:
+                    secure_send(conn, f"[SERVER] Key for {target_user} is not found.")
+                continue
             elif msg.lower() == "online users list": #If 'online users list' message is received from user
                 usersList = f"{returnAvailableUsersList(logList)}"
                 printLogList(logList)
-                conn.send(usersList.encode())
+                secure_send(conn,usersList)
                 continue
 
-
-
-
-
-
-
-
-
-
-
-
-
-        except ConnectionResetError:
+        except (ConnectionResetError, OSError):
             break
 
     conn.close()
     print(f"[DISCONNECT] {addr} disconnected.")
 
 def bindAddressToIdentifier(addr, identifier, nestedList, conn, newIdentifierPassword, logList):
-
-    for elements in nestedList:
-        if verifyRecipientInDataBase(identifier, nestedList):
-            if elements[1] == identifier and elements[3] == newIdentifierPassword and verifyRecipientInLogBase(identifier, logList):
-                nestedList.remove(elements)
-                logList.remove(elements)
-            elif elements[1] == identifier and elements[3] == newIdentifierPassword and verifyRecipientInLogBase(identifier, logList) == False:
-                nestedList.remove(elements)
-            elif elements[1] == identifier and elements[3] != newIdentifierPassword:
-                msg = 'Wrong password'
-                conn.send(msg.encode())
+    is_registered = False
+    for elements in nestedList[:]:
+        if  len(elements)>=4 and elements[1]==identifier:
+            is_registered = True
+            if elements[3] == newIdentifierPassword:
+                elements[2] = conn
+                elements[0] = addr
+                for online_elements in logList[:]:
+                    if len(online_elements)>=4 and online_elements[1] == identifier:
+                        logList.remove(online_elements)
+            else:
+                secure_send(conn, "Wrong Password")
                 return False
 
 
     newIdentifier = [addr, identifier, conn, newIdentifierPassword]
-    nestedList.append(newIdentifier)
+    if not is_registered:
+        nestedList.append(newIdentifier)
     logList.append(newIdentifier)
+    secure_send(conn,"identifier confirmed")
+    return True
 
 def verifyRecipientInDataBase(recipientIdentifier, nestedList):
     output = False
     for rows in nestedList:
-        if rows[1] == recipientIdentifier:
+        if len(rows)>1 and rows[1] == recipientIdentifier:
             output = True
     return output
 
 def verifyRecipientInLogBase(recipientIdentifier, logList):
     output = False
     for rows in logList:
-        if rows[1] == recipientIdentifier:
+        if len(rows)>1 and rows[1] == recipientIdentifier:
             output = True
     return output
 def getNameByConnAddress(currentConn, nestedList):
-    name = "Unknown"
     for rows in nestedList:
         if len(rows)>2 and rows[2] == currentConn:
-            name = rows[1]
-            return name
-    return name
+            return rows[1]
+    return "Unknown"
 def writeMessage(recipientName, msg, nestedList):
     for rows in nestedList:
-        if rows[1] == recipientName:
+        if len(rows)>2 and rows[1] == recipientName:
             target_conn = rows[2]
             target_addr = rows[0]
             try:
-                target_conn.send(msg.encode())
+                secure_send(target_conn, msg)
                 return True
             except (BrokenPipeError, OSError, ConnectionResetError):
                 print(f"Error connecting to {recipientName} Deleting from log database.")
@@ -131,28 +179,21 @@ def writeMessage(recipientName, msg, nestedList):
 
 
 def delFromLogList(addr,logList):
-    cntr = 0
-    for rows in logList:
+    for rows in logList[:]:
         if rows[0] == addr:
-            del logList[cntr]
-            cntr += 1
-            continue
-        else:
-            cntr += 1
-            continue
+            logList.remove(rows)
+
 
 def delFromNestedList(addr,nestedList):
-    cntr = 0
-    for rows in nestedList:
+    for rows in nestedList[:]:
         if rows[0] == addr:
-            del nestedList[cntr]
-            break
-        else:
-            cntr += 1
+            nestedList.remove(rows)
+
 
 def printNestedList(nestedList):
     for rows in nestedList:
-        print(rows)
+        #print(rows)
+        print(rows[:2])
 
 def printLogList(logList):
     for rows in logList:
@@ -160,14 +201,15 @@ def printLogList(logList):
 def returnAvailableUsersList(logList):
     availableUsers = []
     for rows in logList:
-        availableUsers.append(rows[1])
+        if len(rows)>=4 and rows[1] != "ALL ONLINE USERS->" :
+            availableUsers.append(rows[1])
     return availableUsers
+
 # 2. SERVER CONFIGURATION
 PORT = 34567
-SERVER = "0.0.0.0"  # Listens on all available interfaces
+SERVER = "0.0.0.0"
 
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-# This line prevents "Address already in use" errors:
 server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
 try:
@@ -181,11 +223,8 @@ server.listen()
 print(f"[LISTENING] Server is starting on {SERVER}:{PORT}")
 
 while True:
-    # Accept new connection
     conn, addr = server.accept()
 
-    # Create a new thread for each client
-    # target=handle_client refers to the function defined above
     thread = threading.Thread(target=handle_client, args=(conn, addr))
     thread.start()
 
