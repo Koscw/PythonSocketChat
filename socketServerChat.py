@@ -2,7 +2,11 @@ import socket
 import threading
 import struct
 
+threading.stack_size(1024*1024)
+
 pgp_keys_database = {}
+
+db_lock = threading.Lock()
 
 def recv_exact(sock, num_bytes):
     buf = b''
@@ -46,8 +50,9 @@ def handle_client(conn, addr):
             print(f"[{addr}] Command: {msg[:30]}")
 
             if msg.lower() == "terminate":  #If terminate message is received from user
-                delFromLogList(addr, logList)
-                printLogList(logList)
+                with db_lock:
+                    delFromLogList(addr, logList)
+                    printLogList(logList)
                 secure_send(conn, "terminate")
                 connected = False
             elif msg.lower() == "identifier": #If identifier message is received from user
@@ -55,45 +60,49 @@ def handle_client(conn, addr):
                 newIdentifierPassword = recv_msg(conn)
 
                 if newIdentifier and newIdentifierPassword:
-                    success = bindAddressToIdentifier(addr, newIdentifier, nestedList, conn, newIdentifierPassword, logList)
+                    with db_lock:
+                        success = bindAddressToIdentifier(addr, newIdentifier, nestedList, conn, newIdentifierPassword, logList)
 
                     if not success:
                         continue
-                    printNestedList(nestedList)
-                    printLogList(logList)
+                    with db_lock:
+                        printNestedList(nestedList)
+                        printLogList(logList)
 
                 key_packet = recv_msg(conn)
                 if key_packet and key_packet.startswith("CLIENT_KEY:"):
                     _, pem_key = key_packet.split(":",1)
-                    pgp_keys_database[newIdentifier] = pem_key
+                    with db_lock:
+                        pgp_keys_database[newIdentifier] = pem_key
                     print(f"[SYSTEM] Successfully stored PGP Public Key for {newIdentifier}")
 
 
             elif msg.lower() == "message": #If 'message' message is received from user
                 try:
                     recipientName = recv_msg(conn)
-                    senderName = getNameByConnAddress(conn, nestedList)
-                    nameCheck = verifyRecipientInLogBase(recipientName, logList)
+                    with db_lock:
+                        senderName = getNameByConnAddress(conn, nestedList)
+                        nameCheck = verifyRecipientInLogBase(recipientName, logList)
+                        target_key = pgp_keys_database.get(recipientName) if nameCheck else None
                     if not nameCheck:
                         secure_send(conn, f"{recipientName} is not registered or not online.")
-                        _ = recv_msg(conn)
                         continue
 
                     #serverAnswer = f"[{addr}] {recipientName} is registered."
                     #conn.send(serverAnswer.encode())
                     print(f"[{addr}] {recipientName} is registered.")
-                    if recipientName in pgp_keys_database:
-                        exchange_payload = f"PUBKEY_EXCHANGE:{recipientName}:{pgp_keys_database[recipientName]}"
+                    if target_key:
+                        exchange_payload = f"PUBKEY_EXCHANGE:{recipientName}:{target_key}"
                         secure_send(conn, exchange_payload)
                     else:
                         secure_send(conn, f"[SERVER ERROR] {recipientName} hasn't uploaded PGP key]")
-                        _ = recv_msg(conn)
                         continue
                     recipientMessage = recv_msg(conn)
                     if recipientMessage == "CANCEL_MESSAGE" or not recipientMessage:
                         continue
                     adjustedMessage = f"MSG_FROM:{senderName}:{recipientMessage}"
-                    writeMessage(recipientName, adjustedMessage, nestedList )
+                    with db_lock:
+                        writeMessage(recipientName, adjustedMessage, nestedList, logList )
 
                     secure_send(conn, f"{recipientName} received your message")
                     continue
@@ -101,22 +110,25 @@ def handle_client(conn, addr):
                     print(f"Error in message part: {e}")
             elif msg.lower().startswith("get_key:"):
                 _, target_user = msg.split(":",1)
-                has_key = target_user in pgp_keys_database
-                target_key = pgp_keys_database.get(target_user)
+                with db_lock:
+                    has_key = target_user in pgp_keys_database
+                    target_key = pgp_keys_database.get(target_user)
                 if has_key:
                     secure_send(conn, f"PUBKEY_EXCHANGE:{target_user}:{target_key}")
                 else:
                     secure_send(conn, f"[SERVER] Key for {target_user} is not found.")
                 continue
             elif msg.lower() == "online users list": #If 'online users list' message is received from user
-                usersList = f"{returnAvailableUsersList(logList)}"
-                printLogList(logList)
+                with db_lock:
+                    usersList = f"{returnAvailableUsersList(logList)}"
+                    printLogList(logList)
                 secure_send(conn,usersList)
                 continue
 
         except (ConnectionResetError, OSError):
             break
-
+    with db_lock:
+        delFromLogList(addr, logList)
     conn.close()
     print(f"[DISCONNECT] {addr} disconnected.")
 
@@ -161,7 +173,7 @@ def getNameByConnAddress(currentConn, nestedList):
         if len(rows)>2 and rows[2] == currentConn:
             return rows[1]
     return "Unknown"
-def writeMessage(recipientName, msg, nestedList):
+def writeMessage(recipientName, msg, nestedList, logList):
     for rows in nestedList:
         if len(rows)>2 and rows[1] == recipientName:
             target_conn = rows[2]
