@@ -28,6 +28,8 @@ clients_public_keys = {}
 keys_received_event = threading.Event()
 waiting_for_recipient = None
 
+auth_event = threading.Event()
+auth_status = None
 
 
 def recv_exact(sock, num_bytes):
@@ -82,7 +84,7 @@ def load_public_key_from_disk():
                     print(f"[SYSTEM] Failed to load public key from {file_path}: {e}")
 
 def receive_messages():
-    global stop
+    global stop, auth_status
     while not stop:
         try:
             msg = recv_msg(client_socket)
@@ -136,6 +138,12 @@ def receive_messages():
                         print(f"[SYSTEM WARNING] Received new message but Signature Unverified. {sender_name} -> {decrypted.message}")
                 except Exception as e:
                     print(f"\n[SYSTEM] Failed to decrypt message due to error: {e}")
+            elif msg == ("identifier confirmed"):
+                auth_status="SUCCESS"
+                auth_event.set()
+            elif msg == ("Wrong Password"):
+                auth_status="FAILED"
+                auth_event.set()
             else:
                 print(f"\n[SERVER] {msg}")
 
@@ -170,13 +178,29 @@ while not stop:
             break
 
         elif text.strip().lower() == "identifier":
-            identifier = input("ENTER [CLIENT] IDENTIFIER ")
+            client_private_key = None
+            identifier = input("ENTER [CLIENT] IDENTIFIER ").strip()
             secure_send(client_socket, identifier)
+            time.sleep(0.05)
 
             password = getpass.getpass('[CLIENT] ENTER IDENTIFIER PASSWORD: ')
             salt = f"secure_hash_salt_{identifier}"
+
+            auth_event.clear()
+            auth_status = None
             password_hash = hashlib.sha512((password + salt).encode()).hexdigest()
             secure_send(client_socket, password_hash)
+            time.sleep(0.05)
+            auth_event.wait(5.0)
+
+            time.sleep(0.05)
+            if auth_status != "SUCCESS":
+                print("[ERROR] Authentication failed. Wrong password or server timeout")
+                password = None
+                gc.collect()
+                continue
+
+
 
             private_key_file = os.path.join(BASE_DIR, f"{identifier}_private.asc")
             if os.path.exists(private_key_file):
@@ -203,55 +227,63 @@ while not stop:
             secure_send(client_socket, f"CLIENT_KEY:{client_public_key_pem}")
             print(f"[SYSTEM] PGP Key bound to '{identifier}' and shared with server.")
 
-    elif client_private_key.is_protected:
-        print(f"[CLIENT] Activating Secure session with unlocked key")
-        with client_private_key.unlock(password):
-            del password
-            gc.collect()
-            while not stop:
-                text = input("[CLIENT] ")
-                if not text.strip():
-                    continue
-                if text.lower() != "message":
-                    secure_send(client_socket, text)
-
-                if text.strip().lower() == "terminate":
-                    stop = True
-                    break
-                elif text.strip().lower() == "message":
-
-                    recipient = input("ENTER [RECIPIENT] IDENTIFIER ")
-
-                    if recipient not in clients_public_keys:
-                        print(f"[ERROR]  KEY for '{recipient}' is not received yet. Sending querry to the server.")
-                        waiting_for_recipient = recipient
-                        keys_received_event.clear()
-                        secure_send(client_socket, f"GET_KEY:{recipient}")
-                        print(f"[SYSTEM] System waiting for the key from the server. Up to 5 seconds.")
-                        key_received = keys_received_event.wait(5.0)
-                        waiting_for_recipient = None
-
-                        if not key_received or recipient not in clients_public_keys:
-                            print(
-                                f"[ERROR] Cannot receive message, key for '{recipient}' is not received yet. User might be offline.")
+            print(f"[CLIENT] Activating Secure session with unlocked key")
+            try:
+                with client_private_key.unlock(password):
+                    password = None
+                    del password
+                    gc.collect()
+                    while not stop and auth_status == "SUCCESS":
+                        text = input("[CLIENT] ")
+                        if not text.strip():
                             continue
+                        if text.lower() != "message":
+                            secure_send(client_socket, text)
 
-                    message = input("ENTER MESSAGE ")
+                        if text.strip().lower() == "terminate":
+                            stop = True
+                            break
+                        elif text.strip().lower() == "message":
 
-                    pgp_message = PGPMessage.new(message)
-                    recipient_key = clients_public_keys[recipient]
-                    encrypted_msg = recipient_key.encrypt(pgp_message)
-                    encrypted_str = str(encrypted_msg)
+                            recipient = input("ENTER [RECIPIENT] IDENTIFIER ")
 
-                    signedPackage = PGPMessage.new(encrypted_str)
-                    signedPackage |= client_private_key.sign(signedPackage)
+                            if recipient not in clients_public_keys:
+                                print(
+                                    f"[ERROR]  KEY for '{recipient}' is not received yet. Sending querry to the server.")
+                                waiting_for_recipient = recipient
+                                keys_received_event.clear()
+                                secure_send(client_socket, f"GET_KEY:{recipient}")
+                                print(f"[SYSTEM] System waiting for the key from the server. Up to 5 seconds.")
+                                key_received = keys_received_event.wait(1.0)
+                                waiting_for_recipient = None
 
-                    secure_send(client_socket, "message")
-                    secure_send(client_socket, recipient)
-                    secure_send(client_socket, str(signedPackage))
-                    print(f"[SYSTEM] PGP Message sent successfully.")
-                elif text.strip().lower() == "online users list":
-                    continue
+                                if not key_received or recipient not in clients_public_keys:
+                                    print(
+                                        f"[ERROR] Cannot receive message, key for '{recipient}' is not received yet. User might be offline.")
+                                    continue
+
+                            message = input("ENTER MESSAGE ")
+
+                            pgp_message = PGPMessage.new(message)
+                            recipient_key = clients_public_keys[recipient]
+                            encrypted_msg = recipient_key.encrypt(pgp_message)
+                            encrypted_str = str(encrypted_msg)
+
+                            signedPackage = PGPMessage.new(encrypted_str)
+                            signedPackage |= client_private_key.sign(signedPackage)
+
+
+                            secure_send(client_socket, "message")
+                            time.sleep(0.05)
+                            secure_send(client_socket, recipient)
+                            time.sleep(0.05)
+                            secure_send(client_socket, str(signedPackage))
+                            print(f"[SYSTEM] PGP Message sent successfully.")
+                        elif text.strip().lower() == "online users list":
+                            continue
+            except Exception as e:
+                print(f"[ERROR] Key activation failed. Error {e}")
+
 
 
 client_socket.close()

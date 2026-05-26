@@ -1,10 +1,11 @@
 import socket
 import threading
 import struct
+import json
 
 threading.stack_size(1024*1024)
 
-pgp_keys_database = {}
+
 
 db_lock = threading.Lock()
 
@@ -34,14 +35,74 @@ def secure_send(sock, data):
     except (OSError, BrokenPipeError):
         return False
 
+pgp_keys_database = {}
 nestedList = [[('0.0.0.0', 00000), 'ALL REGISTERED USERS->', None, None]]
 logList = [[('0.0.0.0', 00000), 'ALL ONLINE USERS->', None, None]]
+
+def serialize(pgp_keys_database, nestedList):
+    with db_lock:
+
+        adjusted_nestedList = []
+        for rows in nestedList:
+            if len(rows) >= 4:
+                adjusted_nestedList.append([[["0.0.0.0"],0],rows[1],None,rows[3]])
+            else:
+                adjusted_nestedList.append(rows)
+
+        try:
+            with open('pgp_keys_database.json', 'w') as keys_file:
+                json.dump(pgp_keys_database, keys_file, ensure_ascii=False, indent=4)
+
+            with open('nestedList.json', 'w') as db_file:
+                json.dump(adjusted_nestedList, db_file, ensure_ascii=False, indent=4)
+
+        except IOError as e:
+            print(f"[SERVER] Failed to write to file, exception: {e}")
+
+
+
+def deserialize():
+    global pgp_keys_database, nestedList
+    with db_lock:
+        try:
+            with open('pgp_keys_database.json', 'r') as keys_file:
+                keys_file.seek(0)
+                pgp_keys_database = json.load(keys_file)
+
+            with open('nestedList.json', 'r') as db_file:
+                db_file.seek(0)
+                nestedList = json.load(db_file)
+
+
+            adjusted_nestedList = []
+            for rows in nestedList:
+                if len(rows) >= 4 and isinstance(rows[0], list):
+                    adjusted_nestedList.append([tuple(rows[0]),rows[1],rows[2],rows[3]])
+                else:
+                    adjusted_nestedList.append(rows)
+            nestedList = adjusted_nestedList
+            print(f"[SERVER] Successfully read from file.")
+            return pgp_keys_database, nestedList
+        except FileNotFoundError as e:
+            print(f"[SERVER] File not found. Create new one. Exception: {e} ")
+            return pgp_keys_database, nestedList
 
 def handle_client(conn, addr):
     print(f"[NEW CONNECTION] {addr} connected.")
     connected = True
     while connected:
         try:
+            with db_lock:
+                my_name = getNameByConnAddress(conn, nestedList)
+                current_db_conn = None
+                for rows in nestedList:
+                    if len(rows) >= 4 and rows[1]==my_name:
+                        current_db_conn = rows[2]
+            if my_name != "Unknown" and current_db_conn!=conn:
+                print(f"[SERVER] Phantom thread for {my_name} is detected. Killing it now ")
+                break
+
+
             # Receive message from client
             msg = recv_msg(conn)
             if not msg:
@@ -51,10 +112,21 @@ def handle_client(conn, addr):
 
             if msg.lower() == "terminate":  #If terminate message is received from user
                 with db_lock:
-                    delFromLogList(addr, logList)
+                    delFromLogListByConn(conn, logList)
+                    clearConnNestedList(conn, nestedList)
                     printLogList(logList)
                 secure_send(conn, "terminate")
-                connected = False
+                try:
+                    serialize(pgp_keys_database, nestedList)
+                except IOError:
+                    print("[SERVER] Failed to save to the file.")
+                try:
+                    conn.shutdown(socket.SHUT_RDWR)
+                    conn.close()
+                except:
+                    pass
+                print(f"[SERVER] Disconnected {addr} connection closed.")
+                return
             elif msg.lower() == "identifier": #If identifier message is received from user
                 newIdentifier = recv_msg(conn)
                 newIdentifierPassword = recv_msg(conn)
@@ -68,14 +140,24 @@ def handle_client(conn, addr):
                     with db_lock:
                         printNestedList(nestedList)
                         printLogList(logList)
-
                 key_packet = recv_msg(conn)
-                if key_packet and key_packet.startswith("CLIENT_KEY:"):
+                if key_packet and key_packet.startswith("CLIENT_KEY"):
                     _, pem_key = key_packet.split(":",1)
                     with db_lock:
                         pgp_keys_database[newIdentifier] = pem_key
-                    print(f"[SYSTEM] Successfully stored PGP Public Key for {newIdentifier}")
-
+                    print(f"[SYSTEM] Successfully stored/updated PGP key for {newIdentifier}.")
+                else:
+                    print(f"[SYSTEM] Failed to store/update PGP key for {newIdentifier}.")
+                with db_lock:
+                    my_name = getNameByConnAddress(conn, nestedList)
+                    current_db_conn = None
+                    for rows in nestedList:
+                        if len(rows) >= 4 and rows[1] == my_name:
+                            current_db_conn = rows[2]
+                if my_name != "Unknown" and current_db_conn != conn:
+                    print(f"[SERVER] Phantom thread for {my_name} is detected. Killing it now ")
+                    break
+                continue
 
             elif msg.lower() == "message": #If 'message' message is received from user
                 try:
@@ -83,7 +165,7 @@ def handle_client(conn, addr):
                     with db_lock:
                         senderName = getNameByConnAddress(conn, nestedList)
                         nameCheck = verifyRecipientInLogBase(recipientName, logList)
-                        target_key = pgp_keys_database.get(recipientName) if nameCheck else None
+
                     if not nameCheck:
                         secure_send(conn, f"{recipientName} is not registered or not online.")
                         continue
@@ -91,12 +173,7 @@ def handle_client(conn, addr):
                     #serverAnswer = f"[{addr}] {recipientName} is registered."
                     #conn.send(serverAnswer.encode())
                     print(f"[{addr}] {recipientName} is registered.")
-                    if target_key:
-                        exchange_payload = f"PUBKEY_EXCHANGE:{recipientName}:{target_key}"
-                        secure_send(conn, exchange_payload)
-                    else:
-                        secure_send(conn, f"[SERVER ERROR] {recipientName} hasn't uploaded PGP key]")
-                        continue
+
                     recipientMessage = recv_msg(conn)
                     if recipientMessage == "CANCEL_MESSAGE" or not recipientMessage:
                         continue
@@ -128,29 +205,59 @@ def handle_client(conn, addr):
         except (ConnectionResetError, OSError):
             break
     with db_lock:
-        delFromLogList(addr, logList)
+        my_name = getNameByConnAddress(conn, nestedList)
+        current_db_conn = None
+        for rows in nestedList:
+            if len(rows) >= 4 and rows[1] == my_name:
+                current_db_conn = rows[2]
+    if my_name != "Unknown" and current_db_conn != conn:
+        print(f"[SERVER] Old thread for {my_name}  is terminated.")
+        conn.close()
+        return
+
+    with db_lock:
+        delFromLogListByConn(conn, logList)
+        clearConnNestedList(conn, nestedList)
+        try:
+            serialize(pgp_keys_database, nestedList)
+        except IOError:
+            print("[SERVER] Failed to save to the file.")
     conn.close()
     print(f"[DISCONNECT] {addr} disconnected.")
+    return
 
 def bindAddressToIdentifier(addr, identifier, nestedList, conn, newIdentifierPassword, logList):
-    is_registered = False
     for elements in nestedList[:]:
         if  len(elements)>=4 and elements[1]==identifier:
-            is_registered = True
             if elements[3] == newIdentifierPassword:
+                old_connection = elements[2]
+                if old_connection and old_connection!=conn:
+                    try:
+                        secure_send(old_connection, "terminate")
+                        old_connection.shutdown(socket.SHUT_RDWR)
+                        old_connection.close()
+                    except Exception as e:
+                        pass
+
+                for onlineElements in logList[:]:
+                    if len(onlineElements) >= 4 and onlineElements[1] == identifier:
+                        logList.remove(onlineElements)
+
                 elements[2] = conn
                 elements[0] = addr
-                for online_elements in logList[:]:
-                    if len(online_elements)>=4 and online_elements[1] == identifier:
-                        logList.remove(online_elements)
+
+
+
+                logList.append(elements)
+                secure_send(conn, "identifier confirmed")
+                return True
             else:
                 secure_send(conn, "Wrong Password")
                 return False
 
 
     newIdentifier = [addr, identifier, conn, newIdentifierPassword]
-    if not is_registered:
-        nestedList.append(newIdentifier)
+    nestedList.append(newIdentifier)
     logList.append(newIdentifier)
     secure_send(conn,"identifier confirmed")
     return True
@@ -174,7 +281,7 @@ def getNameByConnAddress(currentConn, nestedList):
             return rows[1]
     return "Unknown"
 def writeMessage(recipientName, msg, nestedList, logList):
-    for rows in nestedList:
+    for rows in logList:
         if len(rows)>2 and rows[1] == recipientName:
             target_conn = rows[2]
             target_addr = rows[0]
@@ -183,23 +290,23 @@ def writeMessage(recipientName, msg, nestedList, logList):
                 return True
             except (BrokenPipeError, OSError, ConnectionResetError):
                 print(f"Error connecting to {recipientName} Deleting from log database.")
-                delFromLogList(target_addr,logList)
+                delFromLogListByConn(target_conn,logList)
                 return False
     return False
 
 
 
 
-def delFromLogList(addr,logList):
+def delFromLogListByConn(conn,logList):
     for rows in logList[:]:
-        if rows[0] == addr:
+        if len(rows)>=3 and rows[2] == conn:
             logList.remove(rows)
 
 
-def delFromNestedList(addr,nestedList):
-    for rows in nestedList[:]:
-        if rows[0] == addr:
-            nestedList.remove(rows)
+def clearConnNestedList(conn,nestedList):
+    for rows in nestedList:
+        if len(rows)>=3 and rows[2] == conn:
+            rows[2] = None
 
 
 def printNestedList(nestedList):
@@ -234,8 +341,16 @@ except socket.error as e:
 server.listen()
 print(f"[LISTENING] Server is starting on {SERVER}:{PORT}")
 
+try:
+    deserialize()
+    print("[SERVER] Successfully loaded from the file.")
+except Exception as e:
+    print(f"[SERVER] Failed to load from the file. Exception: {e}")
+
+
 while True:
     conn, addr = server.accept()
+    conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
     thread = threading.Thread(target=handle_client, args=(conn, addr))
     thread.start()
