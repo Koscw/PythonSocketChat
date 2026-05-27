@@ -2,6 +2,10 @@ import socket
 import threading
 import struct
 import json
+import secrets
+from pgpy import PGPKey, PGPMessage, PGPSignature
+
+
 
 threading.stack_size(1024*1024)
 
@@ -95,13 +99,13 @@ def handle_client(conn, addr):
             with db_lock:
                 my_name = getNameByConnAddress(conn, nestedList)
                 current_db_conn = None
-                for rows in nestedList:
-                    if len(rows) >= 4 and rows[1]==my_name:
+                for rows in logList:
+                    if len(rows) >= 4 and rows[1] == my_name:
                         current_db_conn = rows[2]
-            if my_name != "Unknown" and current_db_conn!=conn:
-                print(f"[SERVER] Phantom thread for {my_name} is detected. Killing it now ")
+            if my_name != "Unknown" and current_db_conn != conn:
+                print(f"[SERVER] Old thread for {my_name}  is terminated.")
+                conn.close()
                 break
-
 
             # Receive message from client
             msg = recv_msg(conn)
@@ -129,35 +133,47 @@ def handle_client(conn, addr):
                 return
             elif msg.lower() == "identifier": #If identifier message is received from user
                 newIdentifier = recv_msg(conn)
-                newIdentifierPassword = recv_msg(conn)
+                if not newIdentifier:
+                    continue
 
-                if newIdentifier and newIdentifierPassword:
-                    with db_lock:
-                        success = bindAddressToIdentifier(addr, newIdentifier, nestedList, conn, newIdentifierPassword, logList)
-
-                    if not success:
-                        continue
-                    with db_lock:
-                        printNestedList(nestedList)
-                        printLogList(logList)
-                key_packet = recv_msg(conn)
-                if key_packet and key_packet.startswith("CLIENT_KEY"):
-                    _, pem_key = key_packet.split(":",1)
-                    with db_lock:
-                        pgp_keys_database[newIdentifier] = pem_key
-                    print(f"[SYSTEM] Successfully stored/updated PGP key for {newIdentifier}.")
-                else:
-                    print(f"[SYSTEM] Failed to store/update PGP key for {newIdentifier}.")
                 with db_lock:
-                    my_name = getNameByConnAddress(conn, nestedList)
-                    current_db_conn = None
-                    for rows in nestedList:
-                        if len(rows) >= 4 and rows[1] == my_name:
-                            current_db_conn = rows[2]
-                if my_name != "Unknown" and current_db_conn != conn:
-                    print(f"[SERVER] Phantom thread for {my_name} is detected. Killing it now ")
-                    break
+                    has_key = newIdentifier in pgp_keys_database
+
+                if has_key:
+                    challenge_token = secrets.token_hex(16)
+                    secure_send(conn, f"[PGP AUTH CHALLENGE] {challenge_token}")
+
+                    raw_client_signature = recv_msg(conn)
+                    try:
+                        with db_lock:
+                            public_key_pem = pgp_keys_database[newIdentifier]
+
+                        user_pub_key, _ = PGPKey.from_blob(public_key_pem)
+                        signature = PGPSignature.from_blob(raw_client_signature)
+                        challenge_msg = challenge_token.encode('utf8')
+                        user_pub_key.verify(challenge_msg, signature)
+                        auth_success = True
+                        print(f"[SERVER] Cryptographic signature for {newIdentifier} verified successfully.")
+                    except Exception as e:
+                        print(f"[SERVER WARNING] Failed to verify signature for {newIdentifier}: {e}")
+                        auth_success = False
+                    if not auth_success:
+                        secure_send(conn, "Wrong Password")
+                        continue
+                else:
+                    secure_send(conn, "NEW_ACCOUNT_REQUEST")
+                with db_lock:
+                    bindAddressToIdentifier(addr, newIdentifier,nestedList,conn, logList)
+                if not has_key:
+                    key_packet = recv_msg(conn)
+                    if key_packet and key_packet.startswith("CLIENT_KEY"):
+                        _, pem_key = key_packet.split(":", 1)
+                        with db_lock:
+                            pgp_keys_database[newIdentifier] = pem_key
+                        print(f"[SYSTEM] Successfully stored/updated PGP key for {newIdentifier}.")
+                secure_send(conn, f"[SERVER] Identifier Confirmed")
                 continue
+
 
             elif msg.lower() == "message": #If 'message' message is received from user
                 try:
@@ -178,8 +194,8 @@ def handle_client(conn, addr):
                     if recipientMessage == "CANCEL_MESSAGE" or not recipientMessage:
                         continue
                     adjustedMessage = f"MSG_FROM:{senderName}:{recipientMessage}"
-                    with db_lock:
-                        writeMessage(recipientName, adjustedMessage, nestedList, logList )
+
+                    writeMessage(recipientName, adjustedMessage, logList )
 
                     secure_send(conn, f"{recipientName} received your message")
                     continue
@@ -204,16 +220,7 @@ def handle_client(conn, addr):
 
         except (ConnectionResetError, OSError):
             break
-    with db_lock:
-        my_name = getNameByConnAddress(conn, nestedList)
-        current_db_conn = None
-        for rows in nestedList:
-            if len(rows) >= 4 and rows[1] == my_name:
-                current_db_conn = rows[2]
-    if my_name != "Unknown" and current_db_conn != conn:
-        print(f"[SERVER] Old thread for {my_name}  is terminated.")
-        conn.close()
-        return
+
 
     with db_lock:
         delFromLogListByConn(conn, logList)
@@ -226,40 +233,36 @@ def handle_client(conn, addr):
     print(f"[DISCONNECT] {addr} disconnected.")
     return
 
-def bindAddressToIdentifier(addr, identifier, nestedList, conn, newIdentifierPassword, logList):
+def bindAddressToIdentifier(addr, identifier, nestedList, conn, logList):
+    user_found = False
     for elements in nestedList[:]:
         if  len(elements)>=4 and elements[1]==identifier:
-            if elements[3] == newIdentifierPassword:
-                old_connection = elements[2]
-                if old_connection and old_connection!=conn:
-                    try:
-                        secure_send(old_connection, "terminate")
-                        old_connection.shutdown(socket.SHUT_RDWR)
-                        old_connection.close()
-                    except Exception as e:
-                        pass
+            user_found = True
+            old_connection = elements[2]
+            if old_connection and old_connection != conn:
+                try:
+                    secure_send(old_connection, "terminate")
+                    old_connection.shutdown(socket.SHUT_RDWR)
+                    old_connection.close()
+                except Exception:
+                    pass
 
-                for onlineElements in logList[:]:
-                    if len(onlineElements) >= 4 and onlineElements[1] == identifier:
-                        logList.remove(onlineElements)
+            for onlineElements in logList[:]:
+                if len(onlineElements) >= 4 and onlineElements[1] == identifier:
+                    logList.remove(onlineElements)
 
-                elements[2] = conn
-                elements[0] = addr
+            elements[2] = conn
+            elements[0] = addr
 
-
-
-                logList.append(elements)
-                secure_send(conn, "identifier confirmed")
-                return True
-            else:
-                secure_send(conn, "Wrong Password")
-                return False
+            logList.append(elements)
+            secure_send(conn, "identifier confirmed")
+            return True
 
 
-    newIdentifier = [addr, identifier, conn, newIdentifierPassword]
-    nestedList.append(newIdentifier)
-    logList.append(newIdentifier)
-    secure_send(conn,"identifier confirmed")
+    if not user_found:
+        newIdentifier = [addr, identifier, conn, "PGP_AUTH"]
+        nestedList.append(newIdentifier)
+        logList.append(newIdentifier)
     return True
 
 def verifyRecipientInDataBase(recipientIdentifier, nestedList):
@@ -280,11 +283,10 @@ def getNameByConnAddress(currentConn, nestedList):
         if len(rows)>2 and rows[2] == currentConn:
             return rows[1]
     return "Unknown"
-def writeMessage(recipientName, msg, nestedList, logList):
+def writeMessage(recipientName, msg, logList):
     for rows in logList:
         if len(rows)>2 and rows[1] == recipientName:
             target_conn = rows[2]
-            target_addr = rows[0]
             try:
                 secure_send(target_conn, msg)
                 return True
