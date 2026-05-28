@@ -14,6 +14,11 @@ PORT = 34567
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 KEYS_DIR = os.path.join(BASE_DIR, "trusted_keys")
+os.system("")
+
+BG_GREEN = "\033[42m"
+BG_BLUE = "\033[44m"
+RESET = "\033[0m"
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -84,7 +89,7 @@ def load_public_key_from_disk():
                     print(f"[SYSTEM] Failed to load public key from {file_path}: {e}")
 
 def receive_messages():
-    global stop, auth_status, challenge_token, client_private_key, client_public_key_pem
+    global stop, auth_status, challenge_token, client_private_key, client_public_key_pem, password
     while not stop:
         try:
             msg = recv_msg(client_socket)
@@ -140,9 +145,9 @@ def receive_messages():
                             signature_verified = False
 
                     if signature_verified:
-                        print(f"\n[SYSTEM] Received trusted private message from: <{sender_name}> -> {decryptedPackage.message}")
+                        print(f"{BG_GREEN}\n[SYSTEM] Received trusted private message from: <{sender_name}> -> {decryptedPackage.message} {RESET}")
                     else:
-                        print(f"[SYSTEM WARNING] Received new message but Signature Unverified. {sender_name} -> {decryptedPackage.message}")
+                        print(f"{BG_BLUE}[SYSTEM WARNING] Received new message but Signature Unverified. {sender_name} -> {decryptedPackage.message} {RESET}")
                 except Exception as e:
                     print(f"\n[SYSTEM] Failed to decrypt message due to error: {e}")
             elif msg == "identifier confirmed" or msg == "[SERVER] Identifier Confirmed":
@@ -151,6 +156,8 @@ def receive_messages():
             elif msg == "Wrong Password":
                 auth_status="FAILED"
                 auth_event.set()
+                stop = True
+                break
             else:
                 print(f"\n[SERVER] {msg}")
 
@@ -191,9 +198,8 @@ while not stop:
             password = getpass.getpass('[CLIENT] ENTER IDENTIFIER PASSWORD: ')
 
 
-            auth_event.clear()
-            auth_status = None
-            challenge_token = None
+
+
 
             secure_send(client_socket, "identifier")
             secure_send(client_socket, identifier)
@@ -219,13 +225,14 @@ while not stop:
             print(f"[SYSTEM] Waiting for server response...")
             auth_event.wait(5.0)
 
-            if auth_status == "CHALLENGE" and challenge_token:
+            if auth_status == "CHALLENGE":
+
                 if is_new_account:
                     print(f"[ERROR] Server has a key, but you don't have it locally. Authentification denied.")
                     client_private_key = None
                     continue
                 try:
-                    challenge_msg = challenge_token.encode('utf-8')
+                    challenge_msg = challenge_token.encode()
                     with client_private_key.unlock(password):
                         signature = client_private_key.sign(challenge_msg)
 
@@ -235,6 +242,8 @@ while not stop:
                 except Exception as e:
                     print(f"[ERROR] Failed to sign challenge message: {e}")
                     auth_status = "FAILED"
+                    secure_send(client_socket, "AUTH_CANCEL")
+                    continue
             elif auth_status == "NEW_ACCOUNT":
                 if not is_new_account:
                     print(f"[SYSTEM] You have local key. Server doesn't know you, registering ...")
@@ -260,7 +269,7 @@ while not stop:
 
 
                 while not stop and auth_status == "SUCCESS":
-                    text = input("[CLIENT]").strip()
+                    text = input("[CLIENT] ").strip()
                     if not text:
                         continue
                     if text.lower() not in ["message","online users list"]:
@@ -280,7 +289,7 @@ while not stop:
                             secure_send(client_socket, f"GET_KEY:{recipient}")
                             print(f"[SYSTEM] System waiting for the key from the server. Up to 5 seconds.")
                             key_received = keys_received_event.wait(4.0)
-                            waiting_for_recipient = None
+
 
                             if not key_received or recipient not in clients_public_keys:
                                 print(f"[ERROR] Cannot receive message, key for '{recipient}' is not received yet. User might be offline.")
@@ -293,6 +302,8 @@ while not stop:
                             pgp_message = PGPMessage.new(message)
                             with client_private_key.unlock(password):
                                 pgp_message |= client_private_key.sign(pgp_message)
+
+
 
                             recipient_key = clients_public_keys[recipient]
                             encrypted_package = recipient_key.encrypt(pgp_message)
@@ -313,7 +324,10 @@ while not stop:
                 client_private_key = None
                 client_public_key_pem = None
                 password = None
+                auth_status = None
+                challenge_token = None
                 gc.collect()
+                continue
 
 
 

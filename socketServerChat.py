@@ -11,7 +11,7 @@ threading.stack_size(1024*1024)
 
 
 
-db_lock = threading.Lock()
+db_lock = threading.RLock()
 
 def recv_exact(sock, num_bytes):
     buf = b''
@@ -144,6 +144,10 @@ def handle_client(conn, addr):
                     secure_send(conn, f"[PGP AUTH CHALLENGE] {challenge_token}")
 
                     raw_client_signature = recv_msg(conn)
+                    if not raw_client_signature or raw_client_signature == "AUTH_CANCEL":
+                        print(f"[SERVER] Client {newIdentifier} password incorrect . Disconnecting.")
+                        secure_send(conn, "Wrong Password")
+                        break
                     try:
                         with db_lock:
                             public_key_pem = pgp_keys_database[newIdentifier]
@@ -235,7 +239,7 @@ def handle_client(conn, addr):
 
 def bindAddressToIdentifier(addr, identifier, nestedList, conn, logList):
     user_found = False
-    for elements in nestedList[:]:
+    for elements in nestedList:
         if  len(elements)>=4 and elements[1]==identifier:
             user_found = True
             old_connection = elements[2]
